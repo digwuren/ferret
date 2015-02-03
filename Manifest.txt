@@ -1,0 +1,6 @@
+GPL-3
+History.txt
+Manifest.txt
+README
+sql-ferret.gemspec
+lib/sql-ferret.rb

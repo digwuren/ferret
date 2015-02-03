@@ -1,0 +1,294 @@
+The SQL Ferret wraps SQLite into a navigational database style
+interface.
+
+BEWARE: this is raw and ugly EXPERIMENTAL code, and its API is
+VERY LIKELY to change before 1.0.
+
+
+== Overview
+
+The [[Ferret::new]] constructor takes two arguments: a
+(multiline) string containing the Ferret Data Schema Description
+and a previously opened [[SQLite3::Database]] instance for
+accessing an SQLite database with such a schema.  The resulting
+[[Ferret]] instance's primary useful method is [[go]]; it takes
+one mandatory argument -- the Ferret query string -- and may
+also take numbered and named arguments, as well as a block.
+
+Note that Ferret has TWO distinct DSLs: one for defining the
+data model, one for querying and manipulating it.  When the
+Ferret schema is stored in a text file, it's customarily given a
+name in the form of [[foo.fers]].  Ferret query expressions are
+typically inlined in Ruby code.
+
+
+== Ferret query language
+
+The simplest form of a Ferret query expression is a query over
+one table, filtering by one input column, and producing one
+output column:
+
+  <table> ':' <input-field> '->' <output-field>
+
+Such an expression corresponds to the SQL of
+
+  SELECT <output-field> FROM <table> WHERE <input-field> = ?
+
+Note that in order to process such an expression, [[Ferret#go]]
+requires an extra argument besides the expression -- the
+exemplar value for [[<input-field>]].  The separation of
+expression from data is a deliberate design feature of Ferret:
+on one hand, it's believed to make the expressions clearer; on
+another, it provides a measure of protection against inadvertent
+XSS vulnerabilities.
+
+The <input-field> can be omitted.  In such a case, the query
+fetches all rows from <table>.  If more than one input field is
+supplied, they must be separated by commas and surrounded by
+parentheses, like this.  (Rationale: Ferret's [[->]] operator,
+normally binds very weakly on its left hand side.  While it
+would not be hard to write an exception into the parser, it is
+believed that permitting the surrounding parentheses to be
+omitted is likely to lead to confusing Ferret query
+expressions.)
+
+Multiple output fields can be specified by separating them with
+commas.  Surrounding parentheses are not necessary or permitted
+around the right-hand side of an arrow.
+
+More complex queries involve multiple tables and what relational
+algebra calls /joins/.  Since Ferret aims to provide a
+navigational rather than purely relational interface, it
+presents joins as /dereferencing/, denoted by a trailing [[->]]
+operator.  That is, the query
+
+  houses: number -> resident -> name, phone
+
+can correspond to the SQL of
+
+  SELECT house.number, house.resident, resident.name,
+      resident.age
+  FROM houses LEFT JOIN residents ON
+      houses.resident = residents.id
+  WHERE house.number = ?
+
+provided that the data schema specifies that the column of
+[[houses.resident]] refers to [[resident]] through its [[id]].
+(In SQL parlance, it needs to be defined as a foreign key.)  If,
+instead of [[left join]], an [[inner join]] is desired, the
+two-ended dereferencing arrow [[<->]] needs to be used instead
+of [[->]].
+
+A Ferret data schema permitting such translation might look
+roughly thus:
+
+  [houses]
+  id: primary key, integer
+  number: optional integer
+  name: optional varchar
+  street: varchar
+  resident: optional ref residents(id)
+
+  [residents]
+  id: primary key, integer
+  name: varchar = 'John Smith'
+  phone: optional varchar
+
+Note that the columns are by default _not_ nullable but they can
+be explicitly defined as nullable by the keyword [[optional]].
+The [[=]] character followed by an SQL expression specifies the
+default value for a column.
+
+Also note that in the definition of [[resident: optional ref
+residents(id)]], the [[(id)]] can be omitted because it's clear
+from context -- [[residents.id]] is the primary key of
+[[residents]].
+
+This data schema permits only up to one resident per house.
+What if the house->resident relation needs to have an 1->n shape
+rather than 1->0..1?  We could move the linking column from
+[[houses]] to [[residents]], like this:
+
+  [houses]
+  id: primary key, integer
+  number: optional integer
+  name: optional varchar
+  street: varchar
+  resident: ghost ref residents(house)
+
+  [residents]
+  id: primary key, integer
+  name: varchar = 'John Smith'
+  phone: optional varchar
+  house: optional ref residents
+
+Note that we're still defining [[houses.resident]] but it's no
+longer a /column/ -- that is, it does not have a matching SQL
+table column anymore --, but a /ghost field/.
+
+Besides being primary keys, columns can be defined merely
+[[unique]].  Ferret does not currently support composite
+secondary keys, but a future version might.
+
+How does [[Ferret#go]] deliver its results?  It depends.  If a
+block is given to it, it will call this block with each row;
+otherwise, it collects rows and returns them.  (Actually, if
+Ferret can prove, using [[unique]] and [[primary key]]
+constraints, that the query necessarily produces 0 or 1 rows, it
+will return either [[nil]] or the one row; otherwise, it will
+return an array of the rows.) If the query specifies one column
+(which may be precededed by dereferences); each 'row' will be
+the value without encapsulation; otherwise, Ferret wraps rows
+into [[OpenStruct]] instances.  The multicolumn behaviour can be
+forced by adding an explicit trailing comma after what would
+otherwise be the single requested column.  (Rationale: while
+these rules are a bit clumsy to specify, they have proven
+intuitive, in a Perlish way.)
+
+Each queried column can be given an explicit name, analogously
+to SQL's [[AS]] clause, by specifying
+it between apostrophes after the column appears in the
+expression.  Note that this is not a string literal; rather,
+Ferret parses each apostrophe as a token, and the explicit name
+must parse as a valid Ferret identifier token.
+
+Star topology joins can be specified by surrounding a joining
+arrow together with its right-hand side in parentheses, like
+this:
+
+  houses: number -> resident (-> name, phone), street
+
+Such parentheses can be nested.
+
+In addition to retrieval, Ferret query expressions also support
+modification and deletion of entries.  This is notated by
+terminating an expression in a 'blank' dereference operator
+followed by a colon and a verb, like this:
+
+  houses: number -> resident ->: set
+
+The fields to be changed will then be specified as named
+arguments to [[Ferret#go]].  The verb [[update]] can also be
+used instead of [[set]]; it has exactly the same meaning.  When
+the verb [[delete]] is used, [[Ferret#go]] does not take any
+named arguments.
+
+Outside the Ferret query expression mechanism, there's the
+[[Ferret#insert]] method that takes the target table's name as a
+mandatory argument and the values to be inserted as named
+arguments, like this:
+
+  $ferret.insert 'residents',
+      house: 8,
+      name: 'Jacob Doe',
+      phone: '555-1212'
+
+A future version of Ferret API is likely to provide record
+insertion through [[Ferret#go]].  The reason we're not doing it
+in this public release is that our autovivification mechanisms
+are nowhere near settling yet.
+
+Also of note is [[Ferret#change]], whose signature matches
+[[Ferret#insert]] except that it performs the [[INSERT OR
+REPLACE INTO ...]] operation instead of plain [[INSERT]], and
+[[Ferret#transaction]], which supports recursive locking.
+(This is quirky.  It's mainly intended for use in library
+functions that need to group Ferret or SQL operations for
+atomicity without assuming that an outer transaction exists or
+does not exist, and it needs care even then.  Unless you know
+you need it, you're probably better off using
+[[SQLite3::Database#transaction]] directly.)
+
+Instead of a single input value, it's permitted to
+pass a whole collection of input values to [[Ferret#go]] --
+then, Ferret uses [[foo in (?, ...)]] instead of [[foo = ?]],
+and won't consider this column's possible declared uniquity when
+deciding whether the query is a single-row query --, or [[nil]],
+in which case Ferret uses [[foo is null]] for proper SQL-style
+nullity checking.  (A 'collection' is defined through duck
+typing -- anything that produces more than one value when the
+[[*]] prefix operator is applied to it.)
+
+When it's desired that [[Ferret#go]] produce distinct values, a
+trailing [[: distinct]] or [[: select distinct]] can be used.
+(These two are synonymous.)  Note that for query-type verbs, the
+colon *must not* be preceded by a blank-RHS dereferencing arrow,
+unlike for mutation-type verbs, which require it.
+
+Besides straight values, Ferret supports interpreted values.
+The set of such is currently hardcoded and is:
+
+  iso8601
+  unix_time
+  subsecond_unix_time
+  json
+  pretty_json
+  yaml
+  ruby_marshal
+  packed_hex
+
+When a Ferret schema assigns an interpreted rather than straight
+data type to a column, [[Ferret#go]] will automatically
+interpret and 'deterpret' values for this column, unless the
+column's name is prefixed with a backslash in the expression.
+Note that [[Ferret#insert]] does not (currently?) support
+interpretation, and always processes raw values.
+
+
+== Likely future development
+
+- 'en passant' filters in addition to 'initial' filters.  These
+  will probably be notated by brackets, and may permit
+  ordering comparison in addition to equality checks;
+- use of [[Range]] values in addition to collections as filters
+  passed to [[Ferret#go]];
+- explicit ordering of the produced rows, probably via unary
+  postfix operators;
+- SQL grouping and aggregate functions;
+- [[Ferret#go]] returning rows as a [[Hash]] instead of an
+  [[Array]], using a given key or keys;
+- Kleene dereferencing arrows [[-*>]] and [[-+>]] (and their
+  double-ended [[INNER JOIN]] counterparts), implemented via
+  SQLite's recently introduced [[WITH RECURSIVE]] construct;
+- multi-column uniquity constraints and foreign keys;
+- automated handling of SIKR (Strictly Incremental Knowledge
+  Representation) packets so that Fossil-style multinode
+  tracking could be implemented for (nearly) arbitrary data
+  structures;
+- accessing SQL's views;
+- customisable autovivification in multistage insertions;
+- defining [[Hash]]-like interfaces atop [[Ferret]] that would
+  be backed with a custom, potentially joined, relation in the
+  underlying SQL table;
+- defining per-column access-controlled [[Ferret]]-like subAPIs;
+- integration of [[insert]] and [[change]] into [[Ferret#go]];
+- an interface for Android's built-in SQLite API as available
+  through Ruboto, as an alternative to the [[sqlite3]] Rubygem
+  which is not available on Ruboto;
+- better documentation;
+- renaming to avoid clashing with
+  <https://github.com/jkraemer/ferret>.
+
+
+== Possible future development
+
+- tracking the underlying SQLite database's schema via [[PRAGMA
+  user_version]] and automatically upgrading it;
+- command line tools for database setup and data import and
+  export;
+- transparently joining another table so as to implement
+  [[is-a]] type relation atop a SQL data model;
+- transparently interpreting JSON or YAML data as extra payload
+  fields of their containing table without explicit formal
+  specification, akin to MongoDB;
+- transparent compression of blob/YAML/JSON fields;
+- extracting column type data, constraints, and foreign keys
+  from the [[sqlite_master]] data so that the Ferret schema
+  would only need to specify ghost fields and interpretations;
+- a notation for /ad hoc/ joins;
+- a third, hybrid DSL: Ferret dereference operator extensions to
+  basic SQL queries, something like [[SELECT number, resident ->
+  name, resident -> phone FROM houses WHERE id = ?]] or perhaps
+  [[SELECT number, resident -> (name, phone) FROM ...]];
+- custom enums as interpretations;
+- global primary key definition in the schema.
